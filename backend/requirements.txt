@@ -1,0 +1,28 @@
+# Built-in Libraries (No need to install these as they are part of Python)
+# - os
+# - sys
+# - ctypes
+# - subprocess
+# - urllib.request
+# - time
+# - pathlib
+# - hashlib
+# - json
+# - re
+
+# External Libraries (Install these with pip)
+yt-dlp==2023.3.4  # For downloading videos (alternative to youtube-dl)
+chromadb==0.2.5  # Chroma database
+Flask==2.2.3  # Flask for web app
+flask_cors==3.1.1  # CORS handling for Flask
+opencv-python==4.7.0.72  # For video processing (cv2)
+Pillow==9.5.0  # For image processing (PIL)
+transformers==4.30.0  # For BLIP model (image captioning)
+sentence-transformers==2.2.2  # For sentence embeddings
+whisper==2025.3.1  # For audio transcription with Whisper
+
+# You might want to add other models or specific versions based on your setup
+
+
+#To install all the dependencies, run the following command in the terminal:
+<pip install -r backend/requirements.txt>
