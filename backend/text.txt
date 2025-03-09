@@ -1,0 +1,368 @@
+import os
+import yt_dlp
+import chromadb
+from pathlib import Path
+import hashlib
+from transformers import BlipProcessor, BlipForConditionalGeneration
+from sentence_transformers import SentenceTransformer
+import cv2
+from PIL import Image
+import subprocess
+
+os.environ["TEMP"] = "D:/temp"
+os.environ["TMP"] = "D:/temp"
+os.environ["TRANSFORMERS_CACHE"] = "D:/whisper_cache"
+os.environ["TORCH_HOME"] = "D:/whisper_cache"  # ✅ Forces PyTorch models to D drive
+os.environ["HF_HOME"] = "D:/whisper_cache"  # ✅ Hugging Face cache location
+
+import torch
+print("torch batti",torch.hub.get_dir())
+import whisper
+
+# Directory setup (make sure these directories are on your D drive)
+VIDEO_DIR = "D:/rag/videos"
+AUDIO_DIR = "D:/rag/audios"
+KEYFRAMES_DIR = "D:/rag/keyframes"
+os.makedirs(VIDEO_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(KEYFRAMES_DIR, exist_ok=True)
+
+# Initialize Whisper model
+whisper_model = whisper.load_model("medium")
+print("Whisper model loaded.")
+
+# Initialize Sentence-BERT for vectorization
+sentence_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+print("Sentence-BERT model loaded.")
+
+# Initialize ChromaDB
+client = chromadb.PersistentClient(path="chromadb")
+collection = client.get_or_create_collection(name="video_transcripts")
+print("ChromaDB client initialized.")
+
+# Initialize BLIP for frame descriptions
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+print("BLIP model loaded.")
+
+def generate_video_id(video_url):
+    """Generate a unique video ID using a hash of the URL."""
+    return hashlib.md5(video_url.encode()).hexdigest()
+
+def check_video_exists(video_id):
+    """Check if the video transcript, metadata, and video file already exist in ChromaDB."""
+    transcript_path = os.path.join("D:/rag/transcripts", f"{video_id}.txt")
+    video_path = os.path.join(VIDEO_DIR, f"{video_id}.mp4")
+
+    # ✅ Get all stored documents
+    existing_data = collection.get()
+    existing_ids = set(existing_data.get("ids", []))
+
+    # ✅ Ensure all required components exist
+    if f"{video_id}_0" in existing_ids and os.path.exists(transcript_path) and os.path.exists(video_path):
+        print(f"✅ Video {video_id} already processed. Skipping...")
+        return True  # ✅ Skip reprocessing
+
+    return False  # ❌ Reprocess video
+
+def download_video(video_url, video_id):
+    """Download the full video only if it does not exist."""
+    video_path = os.path.join(VIDEO_DIR, f"{video_id}.mp4")  # Use video_id for filename
+
+    if os.path.exists(video_path):
+        print(f"✅ Video already exists at {video_path}. Skipping download.")
+        return video_path  # ✅ Skip re-downloading
+
+    print(f"⬇️ Downloading video from: {video_url}")
+
+    ydl_opts = {
+        'outtmpl': video_path,  
+        'format': 'best',
+        'noplaylist': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([video_url])
+
+    print(f"✅ Video downloaded: {video_path}")
+    return video_path
+
+
+def download_audio_from_video(video_id):
+    """Extracts audio from the existing video file and converts it to .wav."""
+    video_path = os.path.join(VIDEO_DIR, f"{video_id}.mp4")
+    audio_path = os.path.join(AUDIO_DIR, f"{video_id}.wav")
+
+    if os.path.exists(audio_path):
+        print(f"✅ Audio already exists at {audio_path}. Skipping extraction.")
+        return audio_path  # ✅ Skip re-extraction
+
+    print(f"🎵 Extracting audio from: {video_path} -> {audio_path}")
+
+    command = [
+        "ffmpeg", "-i", video_path,  # ✅ Use corrected video file path
+        "-vn",  # Disable video recording (extract only audio)
+        "-acodec", "pcm_s16le",  # PCM audio codec for WAV format
+        "-ar", "16000",  # Set audio sample rate to 16kHz
+        "-ac", "1",  # Mono channel
+        audio_path  # ✅ Save output to correct filename
+    ]
+
+    try:
+        subprocess.run(command, check=True)
+        print(f"✅ Audio extracted and saved as .wav: {audio_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Error during audio extraction: {e}")
+        return None  # ✅ Return None on failure
+
+    return audio_path
+
+def transcribe_audio(audio_path):
+    """Transcribe audio using Whisper and store/reuse transcription with timestamps."""
+    transcript_path = os.path.join("D:/rag/transcripts", os.path.basename(audio_path).replace(".wav", ".txt"))
+
+    # Check if transcript already exists
+    if os.path.exists(transcript_path):
+        print(f"Loading existing transcript: {transcript_path}")
+        with open(transcript_path, "r", encoding="utf-8") as file:
+            transcript = file.read()
+        return transcript, []  # ⚠️ This returns an empty transcript_times list (Fix this!)
+
+    print(f"Transcribing audio: {audio_path}")
+    result = whisper_model.transcribe(audio_path, word_timestamps=True)
+
+    # Save the transcript
+    os.makedirs("D:/rag/transcripts", exist_ok=True)
+    with open(transcript_path, "w", encoding="utf-8") as file:
+        file.write(result["text"])
+
+    # ✅ Fix: Ensure `transcript_times` is a list of dictionaries
+    transcript_times = [
+        {"start": segment["start"], "end": segment["end"], "text": segment["text"]}
+        for segment in result["segments"]
+    ]
+
+    print(f"Transcript saved to: {transcript_path}")
+    return result["text"], transcript_times  # ✅ Now returns a correctly formatted list
+
+def extract_keyframes(video_path, interval=30):
+    """Extract keyframes every `interval` seconds"""
+    print(f"Extracting keyframes from video: {video_path}")
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    frame_rate = cap.get(cv2.CAP_PROP_FPS)
+    
+    frame_count = 0
+    success, frame = cap.read()
+    while success:
+        if frame_count % int(frame_rate * interval) == 0:
+            frame_file = os.path.join(KEYFRAMES_DIR, f"frame_{frame_count}.jpg")
+            cv2.imwrite(frame_file, frame)
+            frames.append(frame_file)
+        success, frame = cap.read()
+        frame_count += 1
+    cap.release()
+    print(f"{len(frames)} keyframes extracted.")
+    return frames
+
+def generate_frame_description(frame_path):
+    """Generate a description of the frame using BLIP"""
+    print(f"Generating description for frame: {frame_path}")
+    raw_image = Image.open(frame_path).convert("RGB")
+    inputs = processor(raw_image, return_tensors="pt")
+    out = model.generate(**inputs)
+    description = processor.decode(out[0], skip_special_tokens=True)
+    print(f"Description generated for frame: {frame_path}")
+    return description
+
+def chunk_transcript(transcript, transcript_times, chunk_size=200):
+    """Split transcript into smaller chunks and associate them with timestamps."""
+    words = transcript.split()
+    print(f"Chunking transcript into {len(words) // chunk_size} parts.")
+
+    if not transcript_times:  # ✅ Handle missing timestamps safely
+        print("⚠️ Warning: No transcript timestamps found. Default chunking applied.")
+        return [transcript], [{"start_time": 0, "end_time": len(words) / 2}]  # Default fallback
+
+    chunks = []
+    chunk_timestamps = []
+    temp_text = []
+    start_time = None
+    end_time = None
+
+    for seg in transcript_times:
+        if not start_time:
+            start_time = seg.get("start", 0)  # ✅ Use .get() to avoid KeyError
+        
+        temp_text.append(seg.get("text", ""))
+        end_time = seg.get("end", start_time + 5)  # ✅ Set a default end time if missing
+
+        if len(" ".join(temp_text).split()) >= chunk_size:
+            chunks.append(" ".join(temp_text))
+            chunk_timestamps.append({"start_time": start_time, "end_time": end_time})
+            temp_text = []
+            start_time = None  # Reset for next chunk
+
+    if temp_text:
+        chunks.append(" ".join(temp_text))
+        chunk_timestamps.append({"start_time": start_time, "end_time": end_time})
+
+    return chunks, chunk_timestamps  # ✅ Returns chunks with timestamps
+
+def store_metadata(video_id, title, description, video_url, transcript, transcript_times, keyframe_descriptions):
+    """Store video transcript metadata in ChromaDB as vectorized data."""
+    print(f"🔍 Storing metadata for video: {title}")
+
+    # ✅ Get existing metadata safely
+    existing_metadata = collection.get(ids=[f"{video_id}_0"])
+    
+    if existing_metadata and "documents" in existing_metadata and existing_metadata["documents"]:
+        print(f"✅ Metadata already exists for {title}. Checking metadata...")
+
+        # ✅ Fix: Check if metadata exists properly
+        existing_metadatas = existing_metadata.get("metadatas", None)  # ✅ Use .get() safely
+        if existing_metadatas:
+            print("✅ Metadata exists! Skipping processing.")
+            return
+        else:
+            print("⚠️ Warning: Metadata is missing! Re-storing metadata...")
+
+    # ✅ Ensure transcript chunks exist before adding to ChromaDB
+    chunks, chunk_timestamps = chunk_transcript(transcript, transcript_times)
+
+    if not chunks:
+        print("❌ Error: No transcript chunks available for storage.")
+        return
+
+    chunk_metadatas = [
+        {"video_url": video_url, "start_time": chunk_timestamps[i]["start_time"], "end_time": chunk_timestamps[i]["end_time"]}
+        for i in range(len(chunks))
+    ]
+
+    # ✅ Check if embeddings already exist before inserting
+    existing_ids = set(collection.get().get("ids", []))  # ✅ Use .get() to avoid KeyError
+    new_ids = [f"{video_id}_{i}" for i in range(len(chunks))]
+
+    # ✅ Filter out IDs that already exist
+    unique_chunks, unique_metadatas, unique_ids = [], [], []
+    for i, chunk_id in enumerate(new_ids):
+        if chunk_id not in existing_ids:
+            unique_chunks.append(chunks[i])
+            unique_metadatas.append(chunk_metadatas[i])
+            unique_ids.append(chunk_id)
+
+    if unique_chunks:
+        print(f"✅ Adding {len(unique_chunks)} new transcript chunks to ChromaDB.")
+        chunk_vectors = sentence_model.encode(unique_chunks)
+
+        collection.add(
+            documents=unique_chunks,
+            metadatas=unique_metadatas,
+            embeddings=chunk_vectors,
+            ids=unique_ids,
+        )
+    else:
+        print("✅ No new transcript chunks to add.")
+
+    print(f"✅ Metadata successfully stored for {title}.")
+    print(f"✅ Storing metadata for {video_id}. Metadata: {chunk_metadatas}")
+
+
+
+def retrieve_answer(query):
+    """Retrieve relevant video sections based on a user query from ChromaDB."""
+    query_vector = sentence_model.encode(query)
+
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=min(5, len(collection.get()["documents"]))  # ✅ Prevents errors if DB is empty
+    )
+
+    if not results["documents"] or not results["metadatas"]:
+        return "❌ No relevant results found."
+
+    response = []
+    for doc_list, metadata_list in zip(results["documents"], results["metadatas"]):
+        for doc, metadata in zip(doc_list, metadata_list or [{}]):  # ✅ Use empty dict if metadata is None
+            video_url = metadata.get("video_url", "Unknown Video")
+            start_time = metadata.get("start_time", "Unknown Time")
+            response.append(f"🎬 **Video:** {video_url} ⏳ **Start Time:** {start_time}s\n📜 **Excerpt:** {doc}")
+
+    return "\n\n".join(response[:3])  # ✅ Limit to top 3 results
+
+
+
+def clear_chromadb():
+    """Delete all stored embeddings from ChromaDB."""
+    try:
+        existing_data = collection.get()
+        all_ids = existing_data.get("ids", [])  # ✅ Use `.get()` to avoid KeyError
+
+        if all_ids:
+            collection.delete(ids=all_ids)  # ✅ Delete all existing entries
+            print("✅ ChromaDB cleared.")
+        else:
+            print("⚠️ No data found in ChromaDB. Nothing to delete.")
+
+    except Exception as e:
+        print(f"❌ Error while clearing ChromaDB: {e}")
+
+
+if __name__ == "__main__":
+    # Example video list
+    video_links = [
+        "https://www.youtube.com/watch?v=ftDsSB3F5kg",
+        "https://www.youtube.com/watch?v=kKFrbhZGNNI"
+    ]
+    # video_links = [
+    #     "https://www.youtube.com/watch?v=ftDsSB3F5kg"
+    # ]
+    clear_chromadb()
+    for link in video_links:
+        video_id = generate_video_id(link)  # Generate a unique ID for the video
+    
+        if check_video_exists(video_id):
+            print(f"Skipping {link} (Already Processed)")
+            continue  # Skip processing if transcript exists
+
+        # ✅ Pass both `link` (video_url) and `video_id`
+        video_path = download_video(link, video_id)
+        print(f"Downloaded video at: {video_path}")
+
+        
+        # Extract and convert audio from the downloaded video
+        audio_path = download_audio_from_video(video_id)
+        if audio_path:
+            print(f"Audio extracted and converted to .wav at: {audio_path}")
+        else:
+            print(f"Failed to extract audio for {link}. Skipping.")
+            continue
+        
+        # Transcribe audio
+        transcript, transcript_times = transcribe_audio(audio_path)
+        
+        # Extract keyframes from the video
+        keyframes = extract_keyframes(video_path)
+        
+        # Generate descriptions for keyframes
+        keyframe_descriptions = [generate_frame_description(frame) for frame in keyframes]
+        
+        # Store all metadata in ChromaDB
+        store_metadata(video_id, link, "Description placeholder", link, transcript, transcript_times, keyframe_descriptions)
+        
+        print(f"Processed and stored metadata for: {link}")
+
+    # Example User Queries
+    test_queries = [
+    "वीडियो बनाने के लिए एक अच्छी टीम क्यों जरूरी होती है?",
+    "अच्छे निर्देशन के लिए क्या चीजें जरूरी हैं?",
+    "वीडियो एडिटिंग में सबसे महत्वपूर्ण क्या होता है?"
+    ]
+
+    # Run the retriever on each query
+    for query in test_queries:
+        print(f"🔍 **User Query:** {query}\n")
+        print(retrieve_answer(query))
+        print("=" * 80)
+
+
