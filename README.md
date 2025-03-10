@@ -94,4 +94,6 @@ You can check out the GitHub repository later for updates, including LLM integra
 - **Cross-lingual Retrieval**: Users can query in one language and retrieve results from videos in another language.
 - **LLM-Based Refinement**: The current system retrieves raw transcript chunks, but soon an LLM will summarize and improve responses.
 
+Github URL: https://github.com/aryanjain2005/video-rag
+
 Stay tuned for updates! 🚀
